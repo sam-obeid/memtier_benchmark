@@ -1273,6 +1273,271 @@ int memcache_binary_protocol::write_arbitrary_command(const char *val, int val_l
 
 /////////////////////////////////////////////////////////////////////////
 
+class memcache_meta_protocol : public abstract_protocol
+{
+protected:
+    enum response_state
+    {
+        rs_initial,
+        rs_read_header,
+        rs_read_value,
+        rs_read_end
+    };
+    response_state m_response_state;
+    unsigned int m_value_len;
+    size_t m_response_len;
+
+public:
+    memcache_meta_protocol() : m_response_state(rs_initial), m_value_len(0), m_response_len(0) {}
+    virtual memcache_meta_protocol *clone(void) { return new memcache_meta_protocol(); }
+    virtual int select_db(int db);
+    virtual int authenticate(const char *credentials);
+    virtual int configure_protocol(enum PROTOCOL_TYPE type);
+    virtual int write_command_cluster_slots();
+    virtual int write_command_set(const char *key, int key_len, const char *value, int value_len, int expiry,
+                                  unsigned int offset);
+    virtual int write_command_get(const char *key, int key_len, unsigned int offset);
+    virtual int write_command_multi_get(const keylist *keylist);
+    virtual int write_command_wait(unsigned int num_slaves, unsigned int timeout);
+    virtual int parse_response(void);
+
+    // handle arbitrary command
+    virtual bool format_arbitrary_command(arbitrary_command &cmd);
+    virtual int write_arbitrary_command(const command_arg *arg);
+    virtual int write_arbitrary_command(const char *val, int val_len);
+};
+
+int memcache_meta_protocol::select_db(int db)
+{
+    assert(0);
+}
+
+int memcache_meta_protocol::authenticate(const char *credentials)
+{
+    assert(0);
+}
+
+int memcache_meta_protocol::configure_protocol(enum PROTOCOL_TYPE type)
+{
+    assert(0);
+}
+
+int memcache_meta_protocol::write_command_cluster_slots()
+{
+    assert(0);
+}
+
+int memcache_meta_protocol::write_command_set(const char *key, int key_len, const char *value, int value_len,
+                                              int expiry, unsigned int offset)
+{
+    assert(key != NULL);
+    assert(key_len > 0);
+    assert(value != NULL);
+    assert(value_len > 0);
+    int size = 0;
+
+    // ms <key> <datalen> [<flags>]\r\n<data>\r\n
+    // Flags: T<ttl> for expiry
+    if (expiry > 0) {
+        size = evbuffer_add_printf(m_write_buf, "ms %.*s %u T%u\r\n", key_len, key, value_len, expiry);
+    } else {
+        size = evbuffer_add_printf(m_write_buf, "ms %.*s %u\r\n", key_len, key, value_len);
+    }
+    evbuffer_add(m_write_buf, value, value_len);
+    evbuffer_add(m_write_buf, "\r\n", 2);
+    size += value_len + 2;
+
+    return size;
+}
+
+int memcache_meta_protocol::write_command_get(const char *key, int key_len, unsigned int offset)
+{
+    assert(key != NULL);
+    assert(key_len > 0);
+    int size = 0;
+
+    // mg <key> v f\r\n
+    // v = return value, f = return client flags
+    size = evbuffer_add_printf(m_write_buf, "mg %.*s v f\r\n", key_len, key);
+    return size;
+}
+
+int memcache_meta_protocol::write_command_multi_get(const keylist *keylist)
+{
+    assert(keylist != NULL);
+    assert(keylist->get_keys_count() > 0);
+
+    int size = 0;
+
+    // Meta protocol uses pipelining with quiet mode for multi-get:
+    // mg <key1> v f k q\r\n   (quiet - no response unless hit)
+    // mg <key2> v f k q\r\n
+    // ...
+    // mg <keyN> v f k\r\n     (last one without q to flush responses)
+    unsigned int count = keylist->get_keys_count();
+    for (unsigned int i = 0; i < count; i++) {
+        const char *key;
+        unsigned int key_len;
+
+        key = keylist->get_key(i, &key_len);
+        assert(key != NULL);
+
+        int n;
+        if (i < count - 1) {
+            // quiet mode for all but the last key
+            n = evbuffer_add_printf(m_write_buf, "mg %.*s v f k q\r\n", key_len, key);
+        } else {
+            // last key without quiet mode
+            n = evbuffer_add_printf(m_write_buf, "mg %.*s v f k\r\n", key_len, key);
+        }
+        assert(n > 0);
+        size += n;
+    }
+
+    return size;
+}
+
+int memcache_meta_protocol::write_command_wait(unsigned int num_slaves, unsigned int timeout)
+{
+    fprintf(stderr, "error: WAIT command not implemented for memcache meta protocol!\n");
+    assert(0);
+}
+
+int memcache_meta_protocol::parse_response(void)
+{
+    char *line;
+    size_t tmplen;
+
+    while (true) {
+        switch (m_response_state) {
+        case rs_initial:
+            m_last_response.clear();
+            m_response_state = rs_read_header;
+            m_response_len = 0;
+            break;
+
+        case rs_read_header:
+            line = evbuffer_readln(m_read_buf, &tmplen, EVBUFFER_EOL_CRLF_STRICT);
+            if (!line) return 0;
+
+            m_response_len += tmplen + 2; // include CRLF
+            if (m_last_response.get_status() == NULL) {
+                m_last_response.set_status(line);
+            }
+            m_last_response.set_total_len((unsigned int) m_response_len);
+
+            if (memcmp(line, "VA ", 3) == 0) {
+                // VA <size> [<flags>]\r\n<data>\r\n
+                // Value response - parse the data length
+                m_value_len = (unsigned int) strtoul(line + 3, NULL, 10);
+                m_response_state = rs_read_value;
+                continue;
+            } else if (memcmp(line, "HD", 2) == 0) {
+                // HD - "Handled", success with no data (set/delete OK)
+                if (m_last_response.get_status() != line) free(line);
+                m_response_state = rs_read_end;
+                break;
+            } else if (memcmp(line, "EN", 2) == 0) {
+                // EN - "End", not found / miss
+                if (m_last_response.get_status() != line) free(line);
+                m_response_state = rs_read_end;
+                break;
+            } else if (memcmp(line, "MN", 2) == 0) {
+                // MN - meta no-op response
+                if (m_last_response.get_status() != line) free(line);
+                m_response_state = rs_read_end;
+                break;
+            } else if (memcmp(line, "NS", 2) == 0) {
+                // NS - "Not Stored"
+                m_last_response.set_error();
+                benchmark_debug_log("meta protocol: not stored\n");
+                if (m_last_response.get_status() != line) free(line);
+                m_response_state = rs_read_end;
+                break;
+            } else if (memcmp(line, "EX", 2) == 0) {
+                // EX - "Exists" (CAS conflict)
+                m_last_response.set_error();
+                benchmark_debug_log("meta protocol: exists (CAS conflict)\n");
+                if (m_last_response.get_status() != line) free(line);
+                m_response_state = rs_read_end;
+                break;
+            } else if (memcmp(line, "NF", 2) == 0) {
+                // NF - "Not Found" (for delete/CAS operations)
+                m_last_response.set_error();
+                benchmark_debug_log("meta protocol: not found\n");
+                if (m_last_response.get_status() != line) free(line);
+                m_response_state = rs_read_end;
+                break;
+            } else if (strncmp(line, "CLIENT_ERROR", 12) == 0 || strncmp(line, "SERVER_ERROR", 12) == 0 ||
+                       strncmp(line, "ERROR", 5) == 0) {
+                m_last_response.set_error();
+                benchmark_debug_log("meta protocol error: %s\n", line);
+                return -1;
+            } else {
+                m_last_response.set_error();
+                benchmark_debug_log("meta protocol: unexpected response: %s\n", line);
+                if (m_last_response.get_status() != line) free(line);
+                return -1;
+            }
+            break;
+
+        case rs_read_value:
+            if (evbuffer_get_length(m_read_buf) >= m_value_len + 2) {
+                if (m_keep_value) {
+                    char *value = (char *) malloc(m_value_len);
+                    assert(value != NULL);
+
+                    int ret = evbuffer_remove(m_read_buf, value, m_value_len);
+                    assert((unsigned int) ret == m_value_len);
+
+                    m_last_response.set_value(value, m_value_len);
+                } else {
+                    int ret = evbuffer_drain(m_read_buf, m_value_len);
+                    assert((unsigned int) ret == 0);
+                }
+
+                int ret = evbuffer_drain(m_read_buf, 2); // drain CRLF
+                assert((unsigned int) ret == 0);
+
+                m_last_response.incr_hits();
+                m_response_len += m_value_len + 2;
+                m_last_response.set_total_len((unsigned int) m_response_len);
+                m_response_state = rs_read_end;
+            } else {
+                return 0;
+            }
+            break;
+
+        case rs_read_end:
+            m_response_state = rs_initial;
+            return 1;
+
+        default:
+            benchmark_debug_log("meta protocol: unknown response state %d.\n", m_response_state);
+            return -1;
+        }
+    }
+
+    return -1;
+}
+
+bool memcache_meta_protocol::format_arbitrary_command(arbitrary_command &cmd)
+{
+    assert(0);
+}
+
+int memcache_meta_protocol::write_arbitrary_command(const command_arg *arg)
+{
+    assert(0);
+}
+
+int memcache_meta_protocol::write_arbitrary_command(const char *val, int val_len)
+{
+    assert(0);
+}
+
+/////////////////////////////////////////////////////////////////////////
+
 class abstract_protocol *protocol_factory(enum PROTOCOL_TYPE type)
 {
     if (is_redis_protocol(type)) {
@@ -1281,6 +1546,8 @@ class abstract_protocol *protocol_factory(enum PROTOCOL_TYPE type)
         return new memcache_text_protocol();
     } else if (type == PROTOCOL_MEMCACHE_BINARY) {
         return new memcache_binary_protocol();
+    } else if (type == PROTOCOL_MEMCACHE_META) {
+        return new memcache_meta_protocol();
     } else {
         benchmark_error_log("Error: unknown protocol type: %d.\n", type);
         return NULL;
